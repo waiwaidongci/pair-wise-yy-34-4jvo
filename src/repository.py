@@ -8,7 +8,8 @@ from typing import Any, Dict, List, Optional
 
 from .audit import make_entry, utc_now
 from .domain import ConflictError, NotFoundError
-from .rules import ID_PREFIX, STATES
+from .rules import (ID_PREFIX, RECORD_ACCEPTED_STATUS, RECORD_INITIAL_STATUS,
+                    RECORD_STATUSES, STATES)
 
 
 class Repository:
@@ -24,6 +25,7 @@ class Repository:
 
     def _create_schema(self) -> None:
         statuses = ",".join("'" + s.replace("'", "''") + "'" for s in STATES)
+        record_statuses = ",".join("'" + s.replace("'", "''") + "'" for s in RECORD_STATUSES)
         with self.conn:
             self.conn.executescript(f"""
                 CREATE TABLE IF NOT EXISTS items (
@@ -47,12 +49,24 @@ class Repository:
                     item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
                     kind TEXT NOT NULL,
                     detail TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'open'
-                        CHECK(status IN ('open','closed')),
+                    status TEXT NOT NULL DEFAULT '{RECORD_INITIAL_STATUS}'
+                        CHECK(status IN ({record_statuses})),
+                    owner TEXT,
                     external_ref TEXT,
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     UNIQUE(item_id, external_ref)
+                );
+                CREATE TABLE IF NOT EXISTS acceptances (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    record_id INTEGER NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+                    acceptance_no TEXT NOT NULL UNIQUE,
+                    note TEXT NOT NULL,
+                    owner TEXT NOT NULL,
+                    valid INTEGER NOT NULL DEFAULT 1 CHECK(valid IN (0,1)),
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    invalidated_at TEXT
                 );
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -123,7 +137,14 @@ class Repository:
                 raise ConflictError("版本冲突，请刷新后重试")
         return self.get_item(item_id)
 
-    def add_record(self, item_id: int, kind: str, detail: str, status: str,
+    def get_record(self, record_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute("SELECT * FROM records WHERE id=?", (record_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("措施不存在")
+        return dict(row)
+
+    def add_record(self, item_id: int, kind: str, detail: str,
                    external_ref: Optional[str], actor: str) -> Dict[str, Any]:
         now = utc_now()
         self.get_item(item_id)
@@ -132,14 +153,75 @@ class Repository:
                 cur = self.conn.execute(
                     """INSERT INTO records(item_id, kind, detail, status, external_ref,
                        created_by, created_at) VALUES(?,?,?,?,?,?,?)""",
-                    (item_id, kind, detail, status, external_ref, actor, now),
+                    (item_id, kind, detail, RECORD_INITIAL_STATUS, external_ref, actor, now),
                 )
                 record_id = int(cur.lastrowid)
         except sqlite3.IntegrityError as exc:
             raise ConflictError("记录唯一标识已存在") from exc
+        return self.get_record(record_id)
+
+    def accept_record(self, item_id: int, record_id: int, note: str, owner: str,
+                      acceptance_no: str, actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT * FROM records WHERE id=?", (record_id,)).fetchone()
+            if row is None or row["item_id"] != item_id:
+                raise NotFoundError("措施不存在")
+            if row["status"] != RECORD_INITIAL_STATUS:
+                raise ConflictError("措施已验收，不能重复验收")
+            try:
+                cur = self.conn.execute(
+                    """INSERT INTO acceptances(record_id, acceptance_no, note, owner, valid,
+                       created_by, created_at) VALUES(?,?,?,?,1,?,?)""",
+                    (record_id, acceptance_no, note, owner, actor, now),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ConflictError("验收号已存在") from exc
+            acceptance_id = int(cur.lastrowid)
+            self.conn.execute(
+                "UPDATE records SET status=?, owner=? WHERE id=?",
+                (RECORD_ACCEPTED_STATUS, owner, record_id),
+            )
         with self._lock:
-            row = self.conn.execute("SELECT * FROM records WHERE id=?", (record_id,)).fetchone()
+            row = self.conn.execute(
+                "SELECT * FROM acceptances WHERE id=?", (acceptance_id,)).fetchone()
         return dict(row)
+
+    def update_record(self, item_id: int, record_id: int, detail: Optional[str],
+                      owner: Optional[str], bounce: bool, actor: str) -> tuple:
+        now = utc_now()
+        with self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT * FROM records WHERE id=?", (record_id,)).fetchone()
+            if row is None or row["item_id"] != item_id:
+                raise NotFoundError("措施不存在")
+            assignments, params = [], []
+            if detail is not None:
+                assignments.append("detail=?")
+                params.append(detail)
+            if owner is not None:
+                assignments.append("owner=?")
+                params.append(owner)
+            invalidated: List[int] = []
+            if bounce:
+                rows = self.conn.execute(
+                    "SELECT id FROM acceptances WHERE record_id=? AND valid=1",
+                    (record_id,),
+                ).fetchall()
+                invalidated = [int(r["id"]) for r in rows]
+                self.conn.execute(
+                    """UPDATE acceptances SET valid=0, invalidated_at=?
+                       WHERE record_id=? AND valid=1""",
+                    (now, record_id),
+                )
+                assignments.append("status=?")
+                params.append(RECORD_INITIAL_STATUS)
+            if assignments:
+                params.append(record_id)
+                self.conn.execute(
+                    f"UPDATE records SET {', '.join(assignments)} WHERE id=?", params)
+        return self.get_record(record_id), invalidated
 
     def list_records(self, item_id: int) -> List[Dict[str, Any]]:
         self.get_item(item_id)
@@ -149,11 +231,19 @@ class Repository:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def open_record_count(self, item_id: int) -> int:
+    def list_acceptances(self, record_id: int) -> List[Dict[str, Any]]:
+        self.get_record(record_id)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM acceptances WHERE record_id=? ORDER BY id", (record_id,)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def unaccepted_record_count(self, item_id: int) -> int:
         with self._lock:
             row = self.conn.execute(
-                "SELECT COUNT(*) AS n FROM records WHERE item_id=? AND status='open'",
-                (item_id,),
+                "SELECT COUNT(*) AS n FROM records WHERE item_id=? AND status<>?",
+                (item_id, RECORD_ACCEPTED_STATUS),
             ).fetchone()
         return int(row["n"])
 

@@ -84,6 +84,17 @@ def make_handler(service: Service, static_dir: str):
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"items": service.list_items(role)})
+                elif path.startswith("/api/items/") and path.endswith("/acceptances"):
+                    parts = path.split("/")
+                    if len(parts) != 7 or parts[4] != "records":
+                        self._json(404, {"error": "not_found"})
+                    else:
+                        item_id = int(parts[3])
+                        record_id = int(parts[5])
+                        actor, role = self._identity()
+                        del actor
+                        self._json(200, {"acceptances": service.list_acceptances(
+                            item_id, record_id, role)})
                 elif path.startswith("/api/items/") and path.endswith("/records"):
                     item_id = int(path.split("/")[3])
                     actor, role = self._identity()
@@ -113,6 +124,20 @@ def make_handler(service: Service, static_dir: str):
                 elif path.startswith("/api/items/") and path.endswith("/records"):
                     item_id = int(path.split("/")[3])
                     self._json(201, service.add_record(item_id, body, actor, role))
+                elif path.startswith("/api/items/") and (
+                        path.endswith("/accept") or path.endswith("/update")):
+                    parts = path.split("/")
+                    if len(parts) != 7 or parts[4] != "records":
+                        self._json(404, {"error": "not_found"})
+                    else:
+                        item_id = int(parts[3])
+                        record_id = int(parts[5])
+                        if path.endswith("/accept"):
+                            self._json(200, service.accept_record(
+                                item_id, record_id, body, actor, role))
+                        else:
+                            self._json(200, service.update_record(
+                                item_id, record_id, body, actor, role))
                 elif path.startswith("/api/items/") and path.endswith("/transition"):
                     item_id = int(path.split("/")[3])
                     target = body.get("target")
