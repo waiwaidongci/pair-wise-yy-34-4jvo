@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from .domain import ensure_role, normalize_severity, require_number, require_text
+from .domain import (ConflictError, ValidationError, ensure_role,
+                     normalize_severity, require_number, require_text)
 from .repository import Repository
-from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, RECORD_ROLES, TITLE,
-                    VIEW_ROLES, completion_blockers, escalation_required,
-                    priority_score, response_deadline_hours, role_for_transition,
+from .rules import (ACCEPT_ROLES, AUDIT_ROLES, CREATE_ROLES, ENTITY,
+                    RECORD_ROLES, RECORD_STATES, TITLE, VIEW_ROLES,
+                    acceptance_blockers, escalation_required, priority_score,
+                    response_deadline_hours, role_for_transition,
                     validate_transition)
 
 
@@ -42,18 +44,68 @@ class Service:
         actor = require_text(actor, "actor", 100)
         kind = require_text(payload.get("kind"), "kind", 100)
         detail = require_text(payload.get("detail"), "detail")
-        status = payload.get("status", "open")
-        if status not in ("open", "closed"):
-            raise ValueError("status必须是open或closed")
+        status = payload.get("status")
+        if status is not None and status != RECORD_STATES[0]:
+            raise ValidationError("措施登记后必须先处于待验收")
+        owner = payload.get("owner")
+        if owner is not None:
+            owner = require_text(owner, "owner", 100)
         external_ref = payload.get("external_ref")
         if external_ref is not None:
             external_ref = require_text(external_ref, "external_ref", 100)
-        record = self.repository.add_record(item_id, kind, detail, status,
+        record = self.repository.add_record(item_id, kind, detail, owner,
                                             external_ref, actor)
         self.repository.append_audit("record", ENTITY, item_id, actor, {
-            "record_id": record["id"], "kind": kind, "status": status,
+            "record_id": record["id"], "kind": kind, "status": record["status"],
         })
         return record
+
+    def accept_record(self, item_id: int, record_id: int, payload: Dict[str, Any],
+                      actor: str, role: str) -> Dict[str, Any]:
+        ensure_role(role, ACCEPT_ROLES)
+        actor = require_text(actor, "actor", 100)
+        note = require_text(payload.get("note"), "note")
+        owner = require_text(payload.get("owner"), "owner", 100)
+        acceptance_no = require_text(payload.get("acceptance_no"), "acceptance_no", 100)
+        record = self.repository.get_record(item_id, record_id)
+        if record["status"] == RECORD_STATES[1]:
+            raise ConflictError("该措施已验收通过")
+        acceptance = self.repository.create_acceptance(record_id, acceptance_no,
+                                                       note, owner, actor)
+        self.repository.append_audit("accept", ENTITY, item_id, actor, {
+            "record_id": record_id, "acceptance_no": acceptance_no, "owner": owner,
+        })
+        return acceptance
+
+    def update_record(self, item_id: int, record_id: int, payload: Dict[str, Any],
+                      actor: str, role: str) -> Dict[str, Any]:
+        ensure_role(role, RECORD_ROLES)
+        actor = require_text(actor, "actor", 100)
+        record = self.repository.get_record(item_id, record_id)
+        fields: Dict[str, Any] = {}
+        if "detail" in payload:
+            fields["detail"] = require_text(payload.get("detail"), "detail")
+        if "owner" in payload:
+            owner = payload.get("owner")
+            fields["owner"] = None if owner is None else require_text(owner, "owner", 100)
+        if not fields:
+            raise ValidationError("没有可更新的字段")
+        changed = any(record[name] != value for name, value in fields.items())
+        voided_id = None
+        if changed and record["status"] == RECORD_STATES[1]:
+            record, voided_id = self.repository.reopen_record(record_id, fields)
+        else:
+            record = self.repository.update_record(record_id, fields)
+        self.repository.append_audit("record_update", ENTITY, item_id, actor, {
+            "record_id": record_id, "fields": sorted(fields),
+            "acceptance_voided": voided_id is not None,
+        })
+        return record
+
+    def list_acceptances(self, item_id: int, record_id: int, role: str) -> list:
+        self._view(role)
+        self.repository.get_record(item_id, record_id)
+        return self.repository.list_acceptances(record_id)
 
     def transition(self, item_id: int, target: str, expected_version: int,
                    actor: str, role: str) -> Dict[str, Any]:
@@ -63,9 +115,8 @@ class Service:
         ensure_role(role, role_for_transition(target))
         if not isinstance(expected_version, int) or expected_version < 1:
             raise ValueError("expected_version必须是正整数")
-        blockers = completion_blockers(target, self.repository.open_record_count(item_id))
+        blockers = acceptance_blockers(target, self.repository.unaccepted_records(item_id))
         if blockers:
-            from .domain import ConflictError
             raise ConflictError("；".join(blockers))
         updated = self.repository.transition_item(item_id, target, expected_version, actor)
         self.repository.append_audit("transition", ENTITY, item_id, actor, {

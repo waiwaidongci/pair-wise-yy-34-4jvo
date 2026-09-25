@@ -75,26 +75,30 @@ def make_handler(service: Service, static_dir: str):
 
         def do_GET(self) -> None:
             try:
-                path = urlparse(self.path).path
-                if path == "/health":
+                parts = urlparse(self.path).path.strip("/").split("/")
+                if parts == ["health"]:
                     self._json(200, {"status": "ok"})
-                elif path == "/":
+                elif parts == [""]:
                     self._html(root / "index.html")
-                elif path == "/api/items":
+                elif parts == ["api", "items"]:
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"items": service.list_items(role)})
-                elif path.startswith("/api/items/") and path.endswith("/records"):
-                    item_id = int(path.split("/")[3])
+                elif len(parts) == 3 and parts[:2] == ["api", "items"]:
                     actor, role = self._identity()
                     del actor
-                    self._json(200, {"records": service.list_records(item_id, role)})
-                elif path.startswith("/api/items/"):
-                    item_id = int(path.rsplit("/", 1)[-1])
+                    self._json(200, service.get_item(int(parts[2]), role))
+                elif len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "records":
                     actor, role = self._identity()
                     del actor
-                    self._json(200, service.get_item(item_id, role))
-                elif path == "/api/audit":
+                    self._json(200, {"records": service.list_records(int(parts[2]), role)})
+                elif (len(parts) == 6 and parts[:2] == ["api", "items"]
+                      and parts[3] == "records" and parts[5] == "acceptances"):
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, {"acceptances": service.list_acceptances(
+                        int(parts[2]), int(parts[4]), role)})
+                elif parts == ["api", "audit"]:
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"events": service.audit(role)})
@@ -105,20 +109,25 @@ def make_handler(service: Service, static_dir: str):
 
         def do_POST(self) -> None:
             try:
-                path = urlparse(self.path).path
+                parts = urlparse(self.path).path.strip("/").split("/")
                 actor, role = self._identity()
                 body = self._body()
-                if path == "/api/items":
+                if parts == ["api", "items"]:
                     self._json(201, service.create_item(body, actor, role))
-                elif path.startswith("/api/items/") and path.endswith("/records"):
-                    item_id = int(path.split("/")[3])
-                    self._json(201, service.add_record(item_id, body, actor, role))
-                elif path.startswith("/api/items/") and path.endswith("/transition"):
-                    item_id = int(path.split("/")[3])
-                    target = body.get("target")
-                    expected = body.get("expected_version")
+                elif len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "records":
+                    self._json(201, service.add_record(int(parts[2]), body, actor, role))
+                elif len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "transition":
                     self._json(200, service.transition(
-                        item_id, target, expected, actor, role))
+                        int(parts[2]), body.get("target"),
+                        body.get("expected_version"), actor, role))
+                elif (len(parts) == 6 and parts[:2] == ["api", "items"]
+                      and parts[3] == "records" and parts[5] == "accept"):
+                    self._json(201, service.accept_record(
+                        int(parts[2]), int(parts[4]), body, actor, role))
+                elif (len(parts) == 6 and parts[:2] == ["api", "items"]
+                      and parts[3] == "records" and parts[5] == "update"):
+                    self._json(200, service.update_record(
+                        int(parts[2]), int(parts[4]), body, actor, role))
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:

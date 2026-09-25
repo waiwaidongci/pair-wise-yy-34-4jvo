@@ -12,10 +12,14 @@ class FailureTest(unittest.TestCase):
     def test_permission_version_duplicate_and_invariant(self):
         with self.assertRaises(PermissionDenied): self.service.transition(self.item["id"],STATES[1],1,"attacker","viewer")
         with self.assertRaises(ConflictError): self.service.transition(self.item["id"],STATES[1],99,"reviewer",TRANSITION_ROLES[STATES[1]][0])
-        payload={"kind":"action","detail":"same reference","status":"open","external_ref":"DUP-1"}
-        self.service.add_record(self.item["id"],payload,"recorder",'investigator')
+        payload={"kind":"action","detail":"same reference","external_ref":"DUP-1"}
+        record=self.service.add_record(self.item["id"],payload,"recorder",'investigator')
         with self.assertRaises(ConflictError): self.service.add_record(self.item["id"],payload,"recorder",'investigator')
         current=self.service.get_item(self.item["id"],"viewer")
-        for target in STATES[1:-1]: current=self.service.transition(current["id"],target,current["version"],"reviewer",TRANSITION_ROLES[target][0])
+        for target in STATES[1:3]: current=self.service.transition(current["id"],target,current["version"],"reviewer",TRANSITION_ROLES[target][0])
+        with self.assertRaises(ConflictError): self.service.transition(current["id"],STATES[3],current["version"],"reviewer",TRANSITION_ROLES[STATES[3]][0])
+        self.service.accept_record(self.item["id"],record["id"],{"note":"ok","owner":"owner a","acceptance_no":"AC-F1"},"safety",'safety_manager')
+        current=self.service.transition(current["id"],STATES[3],current["version"],"reviewer",TRANSITION_ROLES[STATES[3]][0])
+        self.service.update_record(self.item["id"],record["id"],{"detail":"changed scope"},"editor",'investigator')
         with self.assertRaises(ConflictError): self.service.transition(current["id"],STATES[-1],current["version"],"reviewer",TRANSITION_ROLES[STATES[-1]][0])
 if __name__=="__main__": unittest.main()

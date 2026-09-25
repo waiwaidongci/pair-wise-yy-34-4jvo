@@ -28,11 +28,20 @@ python3 app.py --db ./data.db --port 8311
 - `GET /api/items`
 - `POST /api/items`
 - `GET /api/items/{id}`
-- `POST /api/items/{id}/records`
+- `POST /api/items/{id}/records`，登记纠正措施，一律先进入待验收
+- `POST /api/items/{id}/records/{rid}/accept`，安全员验收，需验收说明、责任人、验收号
+- `POST /api/items/{id}/records/{rid}/update`，修改措施内容或责任人
+- `GET /api/items/{id}/records/{rid}/acceptances`，验收单历史（含已作废）
 - `POST /api/items/{id}/transition`，必须提交`expected_version`
 - `GET /api/audit`
 
 允许角色：reporter, investigator, safety_manager, viewer。严重度越高、伤害指数越大或未关闭措施越多，优先级越高；严重事故必须在4小时内启动调查。
+
+## 验收规则
+
+- 措施登记后停在待验收，不能直接写成已关闭；仅安全员可验收，验收号全局唯一，重复拒绝。
+- 存在无有效验收的措施时，事故不能进入验证；关闭前逐项确认每条措施均已验收。
+- 验收后修改责任人或内容，该措施退回待验收，原通过结论作废，但验收单留存可查。
 
 ## 测试
 
